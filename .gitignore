@@ -20,3 +20,4 @@ build/
 # python (api)
 .venv/
 __pycache__/
+.json

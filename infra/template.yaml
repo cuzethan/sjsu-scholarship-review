@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: SJSU Scholarship - Parse xlsx uploads to DynamoDB
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: sjsu-scholarship-test-parse-trigger
+  ApplicationsTableName:
+    Type: String
+    Default: sjsu-applications
+  ScoresTableName:
+    Type: String
+    Default: sjsu-scores
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 512
+
+Resources:
+  # --- DynamoDB Tables ---
+  ApplicationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ApplicationsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: availability_id
+          AttributeType: S
+        - AttributeName: rubric_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: availability_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: rubric-id-index
+          KeySchema:
+            - AttributeName: rubric_id
+              KeyType: HASH
+            - AttributeName: availability_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ScoresTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ScoresTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: availability_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: availability_id
+          KeyType: HASH
+
+  # --- Lambda Function ---
+  ParseApplicationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sjsu-parse-applications
+      Handler: handler.handler
+      CodeUri: ../lambdas/parse-applications/
+      Environment:
+        Variables:
+          APPLICATIONS_TABLE: !Ref ApplicationsTableName
+          AWS_REGION_NAME: us-west-2
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref BucketName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ApplicationsTableName
+      Events:
+        XlsxUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: data/
+                  - Name: suffix
+                    Value: .xlsx
+
+  # --- S3 Bucket (test bucket for triggering) ---
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+Outputs:
+  ParseFunctionArn:
+    Description: Parse Lambda ARN
+    Value: !GetAtt ParseApplicationsFunction.Arn
+  ApplicationsTableArn:
+    Description: Applications DynamoDB table ARN
+    Value: !GetAtt ApplicationsTable.Arn
+  ScoresTableArn:
+    Description: Scores DynamoDB table ARN
+    Value: !GetAtt ScoresTable.Arn
+  UploadBucketName:
+    Description: S3 bucket for xlsx uploads
+    Value: !Ref UploadBucket

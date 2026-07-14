@@ -1,0 +1,10 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "sjsu-scholarship-parse"
+resolve_s3 = true
+s3_prefix = "sjsu-scholarship-parse"
+region = "us-west-2"
+profile = "Samson"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
