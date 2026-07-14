@@ -151,3 +151,88 @@ for essay_def in config["essay_fields"]:
 5. Run `python parser.py --sample 2` to verify
 
 No changes to `parser.py` needed.
+
+
+---
+
+## 2026-07-14: Lambda Event-Driven Parse + DynamoDB Setup (Samson Chat)
+
+### Context
+
+Discussed the full architecture for the SJSU scholarship pipeline — decided on an event-driven Lambda approach with DynamoDB instead of Bedrock batch (DynamoDB is faster to demo). Then deployed the infrastructure.
+
+### Decisions Made
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Storage | DynamoDB over S3/Bedrock batch | Faster path to a working demo; dashboard can query directly |
+| Applications PK | `availability_id` | Stable ID from xlsx — idempotent on re-parse (no duplicates) |
+| Applications GSI | `rubric_id` + `availability_id` | Query all apps for a specific scholarship |
+| Scores PK | `availability_id` | 1:1 with application record |
+| Scoring approach | Decoupled — separate Lambda triggered manually | Parse and score are independent; no timeout risk |
+| Infra-as-code | Deferred (SAM template removed) | Manual deploy for now; will add SAM later when stable |
+| Parse trigger | S3 event notification on `data/*.xlsx` | Event-driven, no polling |
+
+### What Was Deployed to AWS (account 606263411016, us-west-2, profile: Samson)
+
+| Resource | Name/ARN | Details |
+|----------|----------|---------|
+| S3 bucket (test) | `sjsu-scholarship-test-parse-trigger` | Has `data/` prefix; S3 event notification configured |
+| Lambda function | `sjsu-parse-applications` | Python 3.12, 512MB, 5 min timeout, handler: `handler.handler` |
+| IAM role | `sjsu-parse-lambda-role` | Trust: Lambda service. Policies: CloudWatch logs, S3 GetObject on `data/*`, DynamoDB PutItem/BatchWriteItem on `sjsu-applications` |
+| DynamoDB table | `sjsu-applications` | PK: `availability_id` (S), GSI: `rubric-id-index` (rubric_id HASH + availability_id RANGE), PAY_PER_REQUEST |
+| DynamoDB table | `sjsu-scores` | PK: `availability_id` (S), PAY_PER_REQUEST |
+| S3 → Lambda trigger | Event notification | Fires on `s3:ObjectCreated:*` with prefix `data/` and suffix `.xlsx` |
+
+### Git Branch
+
+`feat/lambda-parse-trigger` — branched from `feat/parser`
+
+### Files Created
+
+```
+lambdas/parse-applications/
+├── handler.py              # Lambda entry point (S3 event → parse xlsx → batch write to DynamoDB)
+├── scholarship_config.py   # Scholarship type configs (copied from Parser/, uses old essays format)
+├── requirements.txt        # pandas==2.2.3, openpyxl==3.1.5, boto3==1.35.0
+├── package/                # Linux-compatible dependencies (built with pip --platform manylinux2014_x86_64)
+└── deployment.zip          # Zipped package uploaded to Lambda
+
+tasks_samson.md             # Full task breakdown for the pipeline (may need re-creation due to OneDrive sync)
+```
+
+### How the Lambda Works
+
+1. S3 event fires when `.xlsx` lands in `data/`
+2. Lambda extracts bucket + key from event
+3. Validates: must be `data/*.xlsx`, not a temp `~$` file
+4. Calls `parse_file()` → identifies scholarship config from filename, reads xlsx, normalizes rows
+5. `write_to_dynamodb()` → batch writes records using `availability_id` as PK
+6. Adds provenance: `source_file`, `parsed_at` (ISO timestamp)
+7. Strips None values (DynamoDB doesn't accept them)
+8. Raises on error (lets Lambda retry)
+
+### ⚠️ Known Issue: Lambda Uses Old Parser Format
+
+The Lambda's `scholarship_config.py` uses the **old `essays` dict format** (hardcoded essay field routing), not the newer `qa_pairs`/`essay_fields` config-driven format documented above. This needs to be synced once the `qa_pairs` parser is finalized and tested.
+
+### How to Test
+
+```bash
+# Upload a test xlsx (filename must match a scholarship config key)
+aws s3 cp "SJSU General Scholarship 26-27 ad hoc report.xlsx" s3://sjsu-scholarship-test-parse-trigger/data/ --profile Samson
+
+# Check DynamoDB for records
+aws dynamodb scan --table-name sjsu-applications --profile Samson --region us-west-2
+
+# Check Lambda logs
+aws logs tail /aws/lambda/sjsu-parse-applications --profile Samson --region us-west-2
+```
+
+### Next Steps
+
+1. Sync Lambda parser with the `qa_pairs` format (once finalized)
+2. Test end-to-end: upload xlsx → verify records in DynamoDB
+3. Build scoring Lambda (reads from `sjsu-applications`, calls Bedrock, writes to `sjsu-scores`)
+4. Wire dashboard API to read from both tables
+5. (Later) Add SAM template for reproducible deployments

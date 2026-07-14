@@ -20,3 +20,8 @@ build/
 # python (api)
 .venv/
 __pycache__/
+
+# lambda build artifacts
+lambdas/**/package/
+lambdas/**/deployment.zip
+lambdas/**/output.json
