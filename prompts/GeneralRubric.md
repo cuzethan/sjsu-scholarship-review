@@ -3,6 +3,7 @@ Use the following criteria, scoring systems, and special instructions to evaluat
 Expected Input:
 Career Goal Essay
 Challenge Essay
+Extracurricular Activities Essay
 
 Category: Extracurricular Activities
 
