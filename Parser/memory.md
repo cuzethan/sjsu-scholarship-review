@@ -345,3 +345,77 @@ aws lambda update-function-code --function-name sjsu-parse-applications \
 2. Define rubric format.
 3. Wire dashboard API to read both tables.
 4. (Later) SAM template for reproducible deploys.
+
+
+---
+
+## 2026-07-15: Composite Key Migration + Bedrock Scoring (Samson Chat)
+
+### Key-design change: application_id → student_id + rubric_id
+
+**Why:** The Excel `Student` column holds a STABLE per-student UUID (e.g.
+`015f4b90-155f-44e9-9af3-adc986747e71`). Previously this landed in `student_name`
+and we keyed on the generated `application_id` (new UUID every parse → not
+idempotent). Renamed `student_name` → `student_id` (it was always a UUID, never a
+name) and switched BOTH tables to composite key:
+- **PK: `student_id`** (stable Excel UUID)
+- **SK: `rubric_id`** (a student can apply to multiple scholarships)
+
+This is stable + unique + idempotent on re-parse.
+
+### Changes made
+
+- `lambdas/parse-applications/scholarship_config.py`: all 4 configs `"Student": "student_name"` → `"student_id"`.
+- `lambdas/parse-applications/handler.py`: record dict `student_id`; skip check on `student_id`; `write_to_dynamodb` now uses `batch_writer(overwrite_by_pkeys=["student_id","rubric_id"])`, item keyed on `student_id`+`rubric_id` (+ application_id, source_file, parsed_at). No more `student_name` anywhere.
+- Recreated both DynamoDB tables (both were safe to drop — app table had only test data, scores was empty):
+  - `sjsu-applications`: PK student_id, SK rubric_id, GSI `rubric-id-index` (rubric_id HASH + student_id RANGE), PAY_PER_REQUEST.
+  - `sjsu-scores`: PK student_id, SK rubric_id, PAY_PER_REQUEST (no GSI).
+- Redeployed Lambda `sjsu-parse-applications`. Re-tested: 281 records parsed and written, verified in DynamoDB (student_id PK + rubric_id SK).
+
+### ⚠️ Build gotcha: OneDrive file lock on package/
+
+Zipping `lambdas/parse-applications/package/` failed with "Access denied" (OneDrive
+holds handles on the pip-installed files). **Workaround:** build deps fresh into a
+temp dir OUTSIDE OneDrive and zip there:
+```powershell
+$b = "$env:TEMP\sjsu-lambda-build"
+pip install --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 --implementation cp --target $b pandas==2.2.3 openpyxl==3.1.5
+Copy-Item handler.py,scholarship_config.py $b
+# zip via [System.IO.Compression.ZipFile]::CreateFromDirectory($b, "$env:TEMP\sjsu-deployment.zip")
+aws lambda update-function-code --function-name sjsu-parse-applications --zip-file fileb://$env:TEMP\sjsu-deployment.zip --profile Samson --region us-west-2
+```
+
+### NEW: Bedrock scoring step (scoring/score.py)
+
+Local Python scorer (source of truth; wrap in Lambda later):
+1. Reads apps from `sjsu-applications` (GSI query by rubric_id, or scan).
+2. Loads matching rubric from `prompts/*.md`:
+   - `sjsu-general`→GeneralRubric.md, `lurie-coed-general`→EducationRubric.md,
+     `coeng-deans`→EngineeringRubric.md, `physics-dept`→PhysicsRubric.md.
+3. Rubric = system prompt (+ strict guardrails: score only from content, quote
+   evidence, say when evidence missing, JSON-only output). qa_pairs + gpa = user msg.
+4. Bedrock **Converse API**, model `us.anthropic.claude-haiku-4-5-20251001-v1:0`
+   (inference profile — needs `us.` prefix), temp 0.0, maxTokens 2048.
+5. Parses JSON (strips ```json fences), writes to `sjsu-scores`:
+   `student_id`+`rubric_id` (key), `application_id`, `scored_at`, `model_id`,
+   `scholarship_type`, `categories: {<Cat>: {Score, Reasoning}}`.
+
+CLI: `--rubric-id`, `--limit`, `--dry-run`. Files: `scoring/score.py`,
+`scoring/README.md`, `scoring/requirements.txt`.
+
+**Verified:** dry-run on 2 Lurie apps → valid Education JSON (CareerGoals/
+PersonalGrowth/LCOEEssay, Score+Reasoning with exact essay quotes). Real run wrote
+2 records to `sjsu-scores` (confirmed via scan).
+
+### Bedrock models available (us-west-2, account 606263411016)
+
+Claude Haiku 4.5 (using), Sonnet 4.5, Opus 4.5, plus older 3.x. All ACTIVE ones
+use INFERENCE_PROFILE (prefix model id with `us.`).
+
+### Next steps
+
+1. Score full batches per rubric (watch cost); consider batching / concurrency.
+2. Wrap scorer in a Lambda (manual/scheduled/DynamoDB-Streams trigger) once prompts finalized.
+3. Wire dashboard API (apps/api) to read sjsu-applications + sjsu-scores.
+4. Add human-review / disagreement workflow later.
+5. IAM for scoring Lambda: bedrock:InvokeModel + dynamodb Query/Scan (apps) + PutItem (scores).

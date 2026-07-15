@@ -84,7 +84,7 @@ def normalize_row(
         "scholarship_type": config["scholarship_type"],
         "rubric_id": config["rubric_id"],
         "year": year,
-        "student_name": None,
+        "student_id": None,
         "availability_id": None,
         "gpa": None,
         "self_reported_gpa": None,
@@ -111,8 +111,8 @@ def normalize_row(
         else:
             record[field_name] = value
 
-    # Skip rows where student_name is missing
-    if record["student_name"] is None:
+    # Skip rows where student_id is missing
+    if record["student_id"] is None:
         return None
 
     # --- qa_pairs from essay_fields ---
@@ -177,22 +177,32 @@ def parse_file(bucket: str, key: str) -> list[dict]:
 
 
 def write_to_dynamodb(records: list[dict], source_file: str):
-    """Batch write parsed records to DynamoDB. PK is application_id (UUID, always unique)."""
+    """Batch write parsed records to DynamoDB.
+
+    Composite key: student_id (PK, stable Excel UUID) + rubric_id (SK).
+    overwrite_by_pkeys de-dupes within a batch if the same student appears twice.
+    """
     table = get_dynamo_table()
     parsed_at = datetime.now(timezone.utc).isoformat()
     written = 0
 
-    with table.batch_writer() as batch:
+    with table.batch_writer(overwrite_by_pkeys=["student_id", "rubric_id"]) as batch:
         for record in records:
+            # Both key attributes are required
+            if not record.get("student_id") or not record.get("rubric_id"):
+                continue
+
             item = {
+                "student_id": record["student_id"],
+                "rubric_id": record["rubric_id"],
                 "application_id": record["application_id"],
                 "source_file": source_file,
                 "parsed_at": parsed_at,
             }
 
-            # Add non-None top-level fields
-            for field in ("scholarship_type", "rubric_id", "year", "student_name",
-                          "availability_id", "academic_program", "academic_level", "major"):
+            # Add non-None top-level fields (keys handled above)
+            for field in ("scholarship_type", "year", "availability_id",
+                          "academic_program", "academic_level", "major"):
                 if record.get(field) is not None:
                     item[field] = record[field]
 

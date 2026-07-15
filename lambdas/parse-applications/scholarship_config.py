@@ -14,7 +14,7 @@ SCHOLARSHIP_CONFIGS = {
         "rubric_id": "sjsu-general",
         "column_map": {
             "AvailabilityId_t": "availability_id",
-            "Student": "student_name",
+            "Student": "student_id",
             "PS_Academic Program": "academic_program",
             "PS_Major(s)": "major",
             "PS_Academic Level": "academic_level",
@@ -43,7 +43,7 @@ SCHOLARSHIP_CONFIGS = {
         "rubric_id": "coeng-deans",
         "column_map": {
             "AvailabilityId_t": "availability_id",
-            "Student": "student_name",
+            "Student": "student_id",
             "PS_Cumulative GPA": "gpa",
         },
         "essay_fields": [
@@ -75,7 +75,7 @@ SCHOLARSHIP_CONFIGS = {
         "rubric_id": "lurie-coed-general",
         "column_map": {
             "AvailabilityId_t": "availability_id",
-            "Student": "student_name",
+            "Student": "student_id",
         },
         "essay_fields": [
             {
@@ -102,7 +102,7 @@ SCHOLARSHIP_CONFIGS = {
         "rubric_id": "physics-dept",
         "column_map": {
             "AvailabilityId_t": "availability_id",
-            "Student": "student_name",
+            "Student": "student_id",
             "PS_Cumulative GPA": "gpa",
             "FASO_General_Self-Reported GPA": "self_reported_gpa",
         },
