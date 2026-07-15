@@ -19,6 +19,7 @@ import argparse
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import boto3
@@ -39,6 +40,36 @@ RUBRIC_FILES = {
     "lurie-coed-general": "EducationRubric.md",
     "coeng-deans": "EngineeringRubric.md",
     "physics-dept": "PhysicsRubric.md",
+}
+
+# Per-category max_score (from prompts/*.md) and weight_pct (must sum to 100 per rubric).
+# Normalized total = sum((score / max_score) * weight_pct) → 0–100 scale.
+# Replace weight_pct values with your official rubric percentages where they differ.
+RUBRIC_CATEGORIES: dict[str, dict[str, dict[str, float]]] = {
+    "sjsu-general": {
+        "XCActivity": {"max_score": 1, "weight_pct": 10},
+        "EssayCareerGoalsScore": {"max_score": 4, "weight_pct": 40},
+        "EssayChallengeScore": {"max_score": 4, "weight_pct": 30},
+        "InitiativeAndMotivation": {"max_score": 3, "weight_pct": 10},
+        "Creativity": {"max_score": 3, "weight_pct": 10},
+    },
+    "lurie-coed-general": {
+        "CareerGoals": {"max_score": 10, "weight_pct": 100 / 3},
+        "PersonalGrowth": {"max_score": 10, "weight_pct": 100 / 3},
+        "LCOEEssay": {"max_score": 10, "weight_pct": 100 / 3},
+    },
+    "coeng-deans": {
+        "Essays": {"max_score": 5, "weight_pct": 50},
+        "ExtracurricularsAndJobs": {"max_score": 5, "weight_pct": 50},
+    },
+    "physics-dept": {
+        "Academics": {"max_score": 5, "weight_pct": 100 / 6},
+        "Research": {"max_score": 5, "weight_pct": 100 / 6},
+        "Service": {"max_score": 5, "weight_pct": 100 / 6},
+        "ChallengesOvercome": {"max_score": 5, "weight_pct": 100 / 6},
+        "FinancialNeed": {"max_score": 5, "weight_pct": 100 / 6},
+        "FacultyEndorsement": {"max_score": 5, "weight_pct": 100 / 6},
+    },
 }
 
 # Extra guardrails appended to every rubric system prompt
@@ -156,6 +187,71 @@ def score_application(bedrock, rubric_text: str, app: dict) -> dict:
     return extract_json(text)
 
 
+def get_categories(score_json: dict) -> dict:
+    """Normalize model output (Categories) vs DynamoDB item (categories)."""
+    return score_json.get("Categories") or score_json.get("categories") or {}
+
+
+def get_category_scores(score_json: dict) -> dict[str, float]:
+    """Return {category_name: raw_score} from either JSON shape."""
+    scores = {}
+    for name, data in get_categories(score_json).items():
+        if isinstance(data, dict) and "Score" in data:
+            scores[name] = float(data["Score"])
+    return scores
+
+
+def compute_total_score(rid: str, score_json: dict) -> float:
+    """Weighted normalized total on a 0–100 scale.
+
+    Each category contributes (score / max_score) * weight_pct.
+    """
+    config = RUBRIC_CATEGORIES.get(rid)
+    if not config:
+        raise ValueError(f"Unknown rubric_id: {rid}")
+
+    scores = get_category_scores(score_json)
+    missing = set(config) - set(scores)
+    if missing:
+        raise ValueError(f"Missing categories for {rid}: {sorted(missing)}")
+
+    total = 0.0
+    for name, spec in config.items():
+        normalized = scores[name] / spec["max_score"]
+        total += normalized * spec["weight_pct"]
+    return round(total, 2)
+
+
+def compute_score_breakdown(rid: str, score_json: dict) -> dict[str, dict]:
+    """Per-category raw score, normalized fraction, and weighted contribution."""
+    config = RUBRIC_CATEGORIES[rid]
+    scores = get_category_scores(score_json)
+    breakdown = {}
+    for name, spec in config.items():
+        raw = scores[name]
+        normalized = raw / spec["max_score"]
+        weighted = normalized * spec["weight_pct"]
+        breakdown[name] = {
+            "raw": raw,
+            "max_score": spec["max_score"],
+            "weight_pct": spec["weight_pct"],
+            "normalized": round(normalized, 4),
+            "weighted": round(weighted, 2),
+        }
+    return breakdown
+
+
+def to_dynamo(value):
+    """Recursively convert floats to Decimal — DynamoDB rejects Python floats."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: to_dynamo(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_dynamo(v) for v in value]
+    return value
+
+
 def write_score(dynamo, app: dict, score_json: dict):
     """Write a score record to sjsu-scores (composite key student_id + rubric_id)."""
     table = dynamo.Table(SCORES_TABLE)
@@ -166,11 +262,12 @@ def write_score(dynamo, app: dict, score_json: dict):
         "scored_at": datetime.now(timezone.utc).isoformat(),
         "model_id": MODEL_ID,
         "scholarship_type": score_json.get("ScholarshipType"),
-        "categories": score_json.get("Categories", score_json),
+        "categories": get_categories(score_json),
+        "total_score": score_json.get("total_score"),
     }
     # drop None values
     item = {k: v for k, v in item.items() if v is not None}
-    table.put_item(Item=item)
+    table.put_item(Item=to_dynamo(item))
 
 
 def main():
@@ -198,6 +295,7 @@ def main():
             if rid not in rubric_cache:
                 rubric_cache[rid] = load_rubric(rid)
             score_json = score_application(bedrock, rubric_cache[rid], app)
+            score_json["total_score"] = compute_total_score(rid, score_json)
 
             if args.dry_run:
                 print(f"[{i}/{len(apps)}] {rid} / {sid}")
