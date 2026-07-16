@@ -26,7 +26,7 @@ import openpyxl
 
 from scholarship_config import (
     NUMERIC_FIELDS, SCHOLARSHIP_SCOPE, build_application_key,
-    candidate_key_from_uuid, extract_year, identify_scholarship,
+    extract_year, identify_scholarship,
 )
 
 logger = logging.getLogger()
@@ -114,8 +114,7 @@ def normalize_row(row: dict, config: dict, year: str,
     if not record["student_uuid"]:
         return None
 
-    record["application_key"] = build_application_key(year, record["student_uuid"])
-    record["candidate_key"] = candidate_key_from_uuid(record["student_uuid"])
+    record["application_key"] = build_application_key(record["student_uuid"])
 
     for essay_def in essay_fields:
         answer = None
@@ -145,6 +144,9 @@ def parse_file(bucket: str, key: str) -> list[dict]:
         return []
 
     year = extract_year(filename) or "unknown"
+    if year != "26-27":
+        logger.info(f"Phase 1 uses 26-27 data only; skipping year '{year}': '{filename}'")
+        return []
     _, rows, sheet_name = read_xlsx_from_s3(bucket, key)
     logger.info(f"Parsing SJSU General | {filename} | year {year}")
 
@@ -172,12 +174,11 @@ def write_to_dynamodb(records: list[dict], source_file: str) -> int:
                 "application_key": record["application_key"],
                 "scholarship_scope": record["scholarship_scope"],
                 "year": record["year"],
-                "student_uuid": record["student_uuid"],
                 "status": record.get("status", "parsed"),
                 "source_file": source_file,
                 "parsed_at": parsed_at,
             }
-            for field in ("availability_id", "candidate_key", "student_name",
+            for field in ("availability_id", "student_name",
                           "academic_program", "academic_level", "major"):
                 if record.get(field) is not None:
                     item[field] = record[field]

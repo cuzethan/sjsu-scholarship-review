@@ -26,12 +26,13 @@ from decimal import Decimal
 
 import boto3
 
-from prompt import build_system_prompt, build_user_message, extract_json, validate, SchemaError
+from prompt import build_system_prompt, build_user_message, extract_json, validate, calculate_final_score, SchemaError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 SCORES_TABLE = os.environ.get("SCORES_TABLE", "sjsu-scores")
+APPLICATIONS_TABLE = os.environ.get("APPLICATIONS_TABLE", "sjsu-applications")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 # Default to a cheap, fast, ACTIVE model. Anthropic models are deterministic with
 # temperature=0 alone (they reject temperature+top_p together).
@@ -63,8 +64,14 @@ def _deserialize(image: dict) -> dict:
     return {k: d.deserialize(v) for k, v in image.items()}
 
 
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+
+
 def score_application(app: dict) -> dict:
-    """Call Bedrock for one application; return a score record (never raises)."""
+    """Call Bedrock for one application; return a score record.
+
+    Retries up to MAX_RETRIES times on JSON parse or schema validation failures.
+    """
     bedrock = _bedrock_client()
     result = {
         "application_key": app.get("application_key"),
@@ -75,7 +82,7 @@ def score_application(app: dict) -> dict:
         "status": "scored",
         "latency_s": None,
         "criterion_scores": None,
-        "weighted_total": None,
+        "llm_weighted_score": None,
         "reasoning_summary": None,
         "confidence": None,
         "failure": None,
@@ -83,39 +90,133 @@ def score_application(app: dict) -> dict:
     infcfg = {"maxTokens": MAX_TOKENS, "temperature": 0}
     if "anthropic." not in MODEL_ID:
         infcfg["topP"] = 1
-    t0 = time.time()
-    try:
-        resp = bedrock.converse(
-            modelId=MODEL_ID,
-            system=[{"text": build_system_prompt()}],
-            messages=[{"role": "user", "content": [{"text": build_user_message(app)}]}],
-            inferenceConfig=infcfg,
-        )
-        result["latency_s"] = round(time.time() - t0, 3)
-        content = resp.get("output", {}).get("message", {}).get("content", [])
-        text = next((b["text"] for b in content if isinstance(b, dict) and "text" in b), "")
-        parsed = extract_json(text)
-        validate(parsed)
-        result["criterion_scores"] = parsed["criterion_scores"]
-        result["weighted_total"] = parsed.get("weighted_total")
-        result["reasoning_summary"] = parsed.get("reasoning_summary")
-        result["confidence"] = parsed.get("confidence")
-    except (json.JSONDecodeError, SchemaError) as e:
-        result["status"] = "score_failed"
-        result["failure"] = f"parse/schema: {e}"
-    except Exception as e:
-        result["status"] = "score_failed"
-        result["failure"] = f"inference: {type(e).__name__}: {e}"
+
+    system_prompt = build_system_prompt()
+    user_message = build_user_message(app)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.time()
+        try:
+            resp = bedrock.converse(
+                modelId=MODEL_ID,
+                system=[{"text": system_prompt}],
+                messages=[{"role": "user", "content": [{"text": user_message}]}],
+                inferenceConfig=infcfg,
+            )
+            result["latency_s"] = round(time.time() - t0, 3)
+            content = resp.get("output", {}).get("message", {}).get("content", [])
+            text = next((b["text"] for b in content if isinstance(b, dict) and "text" in b), "")
+            parsed = extract_json(text)
+            validate(parsed)
+
+            # Success — calculate weighted score out of 100
+            result["criterion_scores"] = parsed["criterion_scores"]
+            result["llm_weighted_score"] = calculate_final_score(parsed["criterion_scores"])
+            result["reasoning_summary"] = parsed.get("reasoning_summary")
+            result["confidence"] = parsed.get("confidence")
+            return result
+
+        except (json.JSONDecodeError, SchemaError) as e:
+            last_error = f"parse/schema (attempt {attempt}/{MAX_RETRIES}): {e}"
+            logger.warning(f"Retry {attempt}/{MAX_RETRIES} for {app.get('application_key')}: {last_error}")
+            continue
+        except Exception as e:
+            # Non-retryable error (network, auth, etc.)
+            result["status"] = "score_failed"
+            result["failure"] = f"inference: {type(e).__name__}: {e}"
+            return result
+
+    # Exhausted retries
+    result["status"] = "score_failed"
+    result["failure"] = last_error
     return result
 
 
 def _write_score(rec: dict):
+    """Write LLM score fields to sjsu-scores using UpdateItem (preserves human score fields)."""
     table = _scores_table()
-    item = {k: v for k, v in rec.items() if v is not None}
-    # DynamoDB rejects Python floats anywhere in the item (incl. nested
-    # criterion_scores). Convert all floats to Decimal via a JSON round-trip.
-    item = json.loads(json.dumps(item), parse_float=Decimal)
-    table.put_item(Item=item)
+
+    app_key = rec.get("application_key")
+    if not app_key:
+        return
+
+    # Build update expression from LLM fields only
+    llm_fields = {
+        "criterion_scores": rec.get("criterion_scores"),
+        "llm_weighted_score": rec.get("llm_weighted_score"),
+        "latency_s": rec.get("latency_s"),
+        "model_id": rec.get("model_id"),
+        "scholarship_scope": rec.get("scholarship_scope"),
+        "scored_at": rec.get("scored_at"),
+        "status": rec.get("status"),
+        "year": rec.get("year"),
+        "sort_key": rec.get("sort_key"),
+        "failure": rec.get("failure"),
+    }
+    # Remove None values
+    llm_fields = {k: v for k, v in llm_fields.items() if v is not None}
+
+    if not llm_fields:
+        return
+
+    # Convert floats to Decimal
+    llm_fields = json.loads(json.dumps(llm_fields), parse_float=Decimal)
+
+    update_parts = []
+    expr_values = {}
+    for i, (k, v) in enumerate(llm_fields.items()):
+        update_parts.append(f"#{k} = :v{i}")
+        expr_values[f":v{i}"] = v
+
+    # Need ExpressionAttributeNames because some field names might be reserved
+    expr_names = {f"#{k}": k for k in llm_fields.keys()}
+
+    table.update_item(
+        Key={"application_key": app_key},
+        UpdateExpression="SET " + ", ".join(update_parts),
+        ExpressionAttributeNames=expr_names,
+        ExpressionAttributeValues=expr_values,
+    )
+
+
+def _update_application(rec: dict):
+    """Write llm_weighted_score and score_status back to the original application record."""
+    global _dynamo
+    if _dynamo is None:
+        _dynamo = boto3.resource("dynamodb", region_name=AWS_REGION)
+    table = _dynamo.Table(APPLICATIONS_TABLE)
+
+    app_key = rec.get("application_key")
+    if not app_key:
+        return
+
+    update_expr = "SET score_status = :status, llm_weighted_score = :score, scored_at = :ts, model_id = :model"
+    expr_values = {
+        ":status": rec["status"],
+        ":score": json.loads(json.dumps(rec.get("llm_weighted_score")), parse_float=Decimal) if rec.get("llm_weighted_score") is not None else None,
+        ":ts": rec["scored_at"],
+        ":model": rec["model_id"],
+    }
+
+    # If scored, also write criterion_scores
+    if rec["status"] == "scored" and rec.get("criterion_scores"):
+        update_expr += ", criterion_scores = :cs"
+        expr_values[":cs"] = json.loads(json.dumps(rec["criterion_scores"]), parse_float=Decimal)
+
+    # If failed, write failure reason
+    if rec.get("failure"):
+        update_expr += ", score_error = :err"
+        expr_values[":err"] = rec["failure"]
+
+    # Remove None values from expression
+    expr_values = {k: v for k, v in expr_values.items() if v is not None}
+
+    table.update_item(
+        Key={"application_key": app_key},
+        UpdateExpression=update_expr,
+        ExpressionAttributeValues=expr_values,
+    )
 
 
 def handler(event, context):
@@ -145,6 +246,7 @@ def handler(event, context):
 
         rec = score_application(app)
         _write_score(rec)
+        _update_application(rec)
         if rec["status"] == "scored":
             scored += 1
         else:

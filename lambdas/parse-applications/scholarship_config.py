@@ -10,12 +10,11 @@ so the architecture stays extensible, but they are NOT part of phase 1 and are
 never scored. `identify_scholarship()` only returns the supported config.
 
 Schema produced by the parser (see handler.normalize_row):
-    application_key   = "sjsu_general#{year}#{student_uuid}"   (deterministic PK)
-    student_uuid      (from Excel "Student" column)
-    availability_id   (raw scholarship label from the sheet; metadata only)
-    candidate_key     (last 12 hex of student_uuid; for evaluation-mode joins)
+    application_key   = student UUID (sole PK, no sort key)
+    availability_id   (raw scholarship label from the sheet)
+    year              (extracted from filename; phase 1 = "26-27" only)
     scholarship_scope = "sjsu_general"
-    year, student_name(None in this data), gpa, academic_program,
+    student_name(None in this data), gpa, academic_program,
     academic_level, major, qa_pairs, source, status
 """
 
@@ -104,14 +103,6 @@ def extract_year(filename: str) -> str | None:
     return m.group(1) if m else None
 
 
-def candidate_key_from_uuid(student_uuid: str) -> str | None:
-    """Last 12 hex chars of the student UUID (final segment). For eval joins."""
-    if not student_uuid:
-        return None
-    hex_only = re.sub(r"[^0-9a-fA-F]", "", str(student_uuid))
-    return hex_only[-12:].lower() if len(hex_only) >= 12 else None
-
-
-def build_application_key(year: str, student_uuid: str) -> str:
-    """Deterministic PK: sjsu_general#{year}#{student_uuid}."""
-    return f"{SCHOLARSHIP_SCOPE}#{year}#{student_uuid}"
+def build_application_key(student_uuid: str) -> str:
+    """PK = student UUID as-is (sole primary key, no sort key)."""
+    return student_uuid

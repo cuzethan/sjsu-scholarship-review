@@ -80,6 +80,26 @@ def extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+# Weights for computing final score out of 100 (SJSU General only — Phase 1)
+WEIGHTS = {
+    "Extracurricular Activities":   {"max": 1, "weight": 10},
+    "Career Goals Essay":           {"max": 4, "weight": 40},
+    "Challenge Essay":              {"max": 4, "weight": 30},
+    "Initiative & Self-Motivation": {"max": 3, "weight": 10},
+    "Creativity":                   {"max": 3, "weight": 10},
+}
+
+
+def calculate_final_score(criterion_scores: list) -> float:
+    """Compute weighted score out of 100 from raw criterion scores."""
+    total = 0.0
+    for cs in criterion_scores:
+        w = WEIGHTS.get(cs["criterion"])
+        if w and w["max"] > 0:
+            total += (cs["score"] / w["max"]) * w["weight"]
+    return round(total, 2)
+
+
 class SchemaError(ValueError):
     pass
 

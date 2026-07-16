@@ -461,3 +461,35 @@ source, status='parsed'. **No rubric_id** in the active path.
 - Bug found + fixed during test: scoring Lambda put_item failed "Float types not supported" — nested criterion_scores floats. Fixed by converting whole item to Decimal via json round-trip (parse_float=Decimal). Redeployed.
 - E2E TEST (2-row synthetic SJSU General 25-26 file uploaded to test bucket data/): parse wrote 2 records to sjsu-applications (application_key sjsu_general#25-26#..., status=parsed); stream triggered score Lambda; Bedrock scored both; sjsu-scores got 2 records (weighted_total, confidence, 5 criterion_scores w/ evidence quotes, reasoning_summary, model_id, status=scored). Verified via scan (Count=2). Test data cleaned up afterward.
 - NOTE: never upload a full ~4880-row SJSU file to the trigger bucket unless you intend thousands of Bedrock scoring calls (stream scores every parsed row). Use small batches or disable the ESM for bulk loads.
+
+## 2026-07-16: Single-PK schema (application_key = UUID only)
+
+Changed the key design per teammate request (their Lambdas broke on the composite
+sort key). Final schema:
+- **sjsu-applications** and **sjsu-scores**: PK = `application_key` (String) = the
+  student UUID, and NOTHING else. No sort key.
+- Phase 1 now uses **26-27 data ONLY** (25-26 dropped). parse_file skips any file
+  whose filename year != "26-27".
+- `build_application_key(uuid)` just returns the UUID. Removed `build_sort_key`
+  and `candidate_key_from_uuid`. Parser no longer stores `sort_key`,
+  `student_uuid` (redundant with PK), or `candidate_key`.
+- Because it's 26-27-only + SJSU-General-only, the UUID alone is unique.
+
+Tables recreated single-PK; new applications stream ARN:
+`arn:aws:dynamodb:us-west-2:606263411016:table/sjsu-applications/stream/2026-07-16T17:45:05.966`.
+New ESM UUID `bd995883-9134-4ede-9796-38010cefd099` (batch 5, LATEST).
+
+Verified: parse Lambda writes UUID-only keys (confirmed via scan — no sort_key /
+student_uuid / candidate_key). Stream delivers records (probe confirmed).
+
+### IMPORTANT — shared-resource collision with teammate
+The `sjsu-score-applications` Lambda and `sjsu-scores` table are SHARED with a
+teammate. A teammate **redeployed the scoring Lambda at 17:52:03** (after my
+17:44 deploy), replacing my code. Their version writes `llm_weighted_score`
+(not my `weighted_total`) and calls `UpdateItem` — which fails
+`AccessDeniedException` because `sjsu-score-lambda-role` only grants `PutItem` on
+sjsu-scores. Their code does NOT use sort_key, so the single-PK change is
+compatible with their consumer (a probe record was scored successfully by it).
+Did NOT overwrite their deployment. If we own scoring again, either re-grant our
+code or add `dynamodb:UpdateItem` to the role for their code. Coordinate before
+redeploying the scoring function.
