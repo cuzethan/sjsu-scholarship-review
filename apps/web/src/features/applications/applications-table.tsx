@@ -10,11 +10,10 @@ import {
 import { SortableHead } from "@/sjsu/components/ui/sortable-head";
 import { useTableSort } from "@/sjsu/lib/use-table-sort";
 import { ChevronDown, ChevronRight, TriangleAlert } from "lucide-react";
-import { cn } from "@/sjsu/lib/utils";
 import { ApplicationReviewDialog } from "./application-review-dialog";
 import { DIVERGENCE_THRESHOLD, type TableRow as AppRow } from "./review-data";
 
-type SortField = "student" | "scholarship" | "gpa" | "score" | "delta";
+type SortField = "student" | "scholarship" | "score";
 
 // shape returned by GET /applications (apps/api/main.py)
 type ApiRow = {
@@ -66,9 +65,7 @@ export function ApplicationsTable() {
     const dir = sortDir === "asc" ? 1 : -1;
     const sorted = [...filtered].sort((a, b) => {
       if (!sortBy) return (Math.abs(b.delta ?? 0) - Math.abs(a.delta ?? 0)) || (b.aiPercent - a.aiPercent);
-      if (sortBy === "gpa") return ((a.gpa ?? -1) - (b.gpa ?? -1)) * dir;
       if (sortBy === "score") return (a.aiPercent - b.aiPercent) * dir;
-      if (sortBy === "delta") return (Math.abs(a.delta ?? 0) - Math.abs(b.delta ?? 0)) * dir;
       return String(a[sortBy]).localeCompare(String(b[sortBy])) * dir;
     });
 
@@ -119,20 +116,14 @@ export function ApplicationsTable() {
       ) : (
         <Table>
           <colgroup>
-            <col className="w-28" /><col className="w-36" /><col className="w-48" />
-            <col className="w-16" /><col className="w-36" /><col className="w-24" />
-            <col className="w-16" /><col className="w-16" />
+            <col className="w-28" /><col className="w-36" /><col className="w-64" /><col className="w-40" />
           </colgroup>
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <SortableHead field="student" {...sortProps}>Student</SortableHead>
               <SortableHead field="scholarship" {...sortProps}>Scholarship</SortableHead>
               <TableHead>Major</TableHead>
-              <SortableHead field="gpa" {...sortProps}>GPA</SortableHead>
               <SortableHead field="score" {...sortProps}>AI score</SortableHead>
-              <TableHead>Conf</TableHead>
-              <TableHead>Human</TableHead>
-              <SortableHead field="delta" {...sortProps}>D</SortableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -145,7 +136,7 @@ export function ApplicationsTable() {
             ))}
 
             <TableRow className="cursor-pointer hover:bg-muted/50" onClick={() => setShowAgreed((v) => !v)}>
-              <TableCell colSpan={8} className="py-2 text-xs font-medium text-muted-foreground">
+              <TableCell colSpan={4} className="py-2 text-xs font-medium text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   {showAgreed ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
                   rest ({agreed.length})
@@ -192,7 +183,7 @@ function EmptyMsg({ children }: { children: React.ReactNode }) {
 function PileHeader({ children }: { children: React.ReactNode }) {
   return (
     <TableRow className="hover:bg-transparent">
-      <TableCell colSpan={8} className="py-2 text-xs font-medium text-muted-foreground">
+      <TableCell colSpan={4} className="py-2 text-xs font-medium text-muted-foreground">
         <span className="flex items-center gap-1.5">{children}</span>
       </TableCell>
     </TableRow>
@@ -200,15 +191,11 @@ function PileHeader({ children }: { children: React.ReactNode }) {
 }
 
 function ApplicationRow({ row, onClick }: { row: AppRow; onClick: () => void }) {
-  const split = row.delta != null && Math.abs(row.delta) >= DIVERGENCE_THRESHOLD;
   return (
     <TableRow className="cursor-pointer" onClick={onClick}>
       <TableCell className="font-medium">{row.student}</TableCell>
       <TableCell>{row.scholarship}</TableCell>
       <TableCell className="truncate text-muted-foreground">{row.major}</TableCell>
-      <TableCell>
-        {row.gpa == null ? <span className="text-muted-foreground">-</span> : <Badge variant="secondary">{row.gpa.toFixed(1)}</Badge>}
-      </TableCell>
       <TableCell>
         {row.status !== "scored" ? (
           <span className="text-xs text-muted-foreground">pending</span>
@@ -219,25 +206,6 @@ function ApplicationRow({ row, onClick }: { row: AppRow; onClick: () => void }) 
             </div>
             <span className="tabular-nums text-xs text-muted-foreground">{row.aiPercent}%</span>
           </div>
-        )}
-      </TableCell>
-      <TableCell>
-        {row.lowCount > 0 ? (
-          <Badge variant="warning"><TriangleAlert /> low</Badge>
-        ) : (
-          <span className="text-xs text-muted-foreground">solid</span>
-        )}
-      </TableCell>
-      <TableCell className="tabular-nums text-xs text-muted-foreground">
-        {row.humanPercent == null ? "-" : `${row.humanPercent}%`}
-      </TableCell>
-      <TableCell>
-        {row.delta == null ? (
-          <span className="text-xs text-muted-foreground">-</span>
-        ) : (
-          <span className={cn("tabular-nums text-xs", split ? "font-medium text-warning" : "text-muted-foreground")}>
-            {row.delta > 0 ? "+" : ""}{row.delta}
-          </span>
         )}
       </TableCell>
     </TableRow>
