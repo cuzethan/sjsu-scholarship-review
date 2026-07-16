@@ -102,12 +102,23 @@ def _scholarship_label(scope):
     return SCHOLARSHIP_LABELS.get(scope, scope or "\u2014")
 
 
+def _full_scan(table):
+    """Paginated scan — DynamoDB returns max 1MB per call."""
+    items = []
+    resp = table.scan()
+    items.extend(resp.get("Items", []))
+    while "LastEvaluatedKey" in resp:
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+        items.extend(resp.get("Items", []))
+    return items
+
+
 @app.get("/applications")
 def applications_list():
     """Dashboard rows: sjsu-applications joined with sjsu-scores (AI + human)."""
     try:
-        apps = applications_table().scan().get("Items", [])
-        scores = {s.get("application_key"): s for s in scores_table().scan().get("Items", [])}
+        apps = _full_scan(applications_table())
+        scores = {s.get("application_key"): s for s in _full_scan(scores_table())}
     except Exception:
         logger.exception("failed to read applications/scores")
         raise HTTPException(status_code=502, detail="could not read data store")
