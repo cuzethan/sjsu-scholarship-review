@@ -30,8 +30,8 @@ export type ScoringRecord = {
   composite: number;
   compositeMax: number;
   percent: number; // AI composite normalized to 0–100 so rubrics compare
-  humanPercent: number; // MOCK until real reader scores land
-  delta: number; // aiPercent - humanPercent, signed
+  humanPercent: number | null; // real reader score when ingested, else null
+  delta: number | null; // aiPercent - humanPercent; null when no human score
 };
 
 export type Application = {
@@ -224,8 +224,8 @@ export type TableRow = Application & {
   aiComposite: number;
   aiCompositeMax: number;
   aiPercent: number;
-  humanPercent: number; // MOCK until real reader scores land
-  delta: number; // aiPercent - humanPercent, signed: positive = AI scored higher
+  humanPercent: number | null; // real reader score when ingested, else null
+  delta: number | null; // aiPercent - humanPercent; null when no human score
   needsHuman: boolean; // past threshold OR any low-confidence category
   lowCount: number;
 };
