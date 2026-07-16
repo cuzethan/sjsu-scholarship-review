@@ -102,31 +102,39 @@ def _scholarship_label(scope):
     return SCHOLARSHIP_LABELS.get(scope, scope or "\u2014")
 
 
-def _full_scan(table):
+def _full_scan(table, **kwargs):
     """Paginated scan — DynamoDB returns max 1MB per call."""
     items = []
-    resp = table.scan()
+    resp = table.scan(**kwargs)
     items.extend(resp.get("Items", []))
     while "LastEvaluatedKey" in resp:
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
         items.extend(resp.get("Items", []))
     return items
 
 
-@app.get("/applications")
-def applications_list():
-    """Dashboard rows: sjsu-applications joined with sjsu-scores (AI + human)."""
-    try:
-        apps = _full_scan(applications_table())
-        scores = {s.get("application_key"): s for s in _full_scan(scores_table())}
-    except Exception:
-        logger.exception("failed to read applications/scores")
-        raise HTTPException(status_code=502, detail="could not read data store")
+# In-memory cache for the dashboard list (avoids re-scanning 4800+ items on every request)
+_list_cache: dict = {"rows": None, "ts": 0}
+_CACHE_TTL = 60  # seconds
+
+
+def _build_list_rows():
+    """Projected scan of both tables (only fields needed for the table view)."""
+    apps = _full_scan(
+        applications_table(),
+        ProjectionExpression="application_key, scholarship_scope, major, academic_level, gpa, #y",
+        ExpressionAttributeNames={"#y": "year"},
+    )
+    scores = _full_scan(
+        scores_table(),
+        ProjectionExpression="application_key, llm_weighted_score, human_weighted_total",
+    )
+    score_map = {s.get("application_key"): s for s in scores}
 
     rows = []
     for a in apps:
         key = a.get("application_key")
-        score = scores.get(key, {})
+        score = score_map.get(key, {})
         ai = _round(_to_float(score.get("llm_weighted_score")))
         human = _round(_to_float(score.get("human_weighted_total")))
         delta = (ai - human) if (ai is not None and human is not None) else None
@@ -146,7 +154,25 @@ def applications_list():
             "needsHuman": needs_human,
             "status": "scored" if ai is not None else "pending",
         })
-    logger.info("applications_list: %d apps, %d scored", len(rows), sum(1 for r in rows if r["status"] == "scored"))
+    return rows
+
+
+@app.get("/applications")
+def applications_list():
+    """Dashboard rows: sjsu-applications joined with sjsu-scores (AI + human). Cached 60s."""
+    now = time.time()
+    if _list_cache["rows"] is not None and (now - _list_cache["ts"]) < _CACHE_TTL:
+        return {"applications": _list_cache["rows"]}
+
+    try:
+        rows = _build_list_rows()
+    except Exception:
+        logger.exception("failed to read applications/scores")
+        raise HTTPException(status_code=502, detail="could not read data store")
+
+    _list_cache["rows"] = rows
+    _list_cache["ts"] = now
+    logger.info("applications_list: %d apps, %d scored (cache refreshed)", len(rows), sum(1 for r in rows if r["status"] == "scored"))
     return {"applications": rows}
 
 
