@@ -1,149 +1,117 @@
 """
-Scholarship type configurations.
+scholarship_config.py — Phase 1 scope: SJSU General Scholarship ONLY.
 
-Each config maps a filename pattern to:
-- scholarship_type: human-readable label (passed to LLM for rubric selection)
-- rubric_id: machine key for rubric lookup
-- column_map: raw Excel column -> normalized field name (non-essay fields only)
-- essay_fields: list of essay field definitions that drive qa_pairs construction
+Phase 1 actively supports a single scholarship (SJSU General) across both the
+25-26 and 26-27 datasets, using ONE shared rubric + ONE shared prompt. The
+active path has no `rubric_id` and no multi-rubric branching.
+
+Specialized/department scholarships are kept as clearly-marked UNSUPPORTED stubs
+so the architecture stays extensible, but they are NOT part of phase 1 and are
+never scored. `identify_scholarship()` only returns the supported config.
+
+Schema produced by the parser (see handler.normalize_row):
+    application_key   = "sjsu_general#{year}#{student_uuid}"   (deterministic PK)
+    student_uuid      (from Excel "Student" column)
+    availability_id   (raw scholarship label from the sheet; metadata only)
+    candidate_key     (last 12 hex of student_uuid; for evaluation-mode joins)
+    scholarship_scope = "sjsu_general"
+    year, student_name(None in this data), gpa, academic_program,
+    academic_level, major, qa_pairs, source, status
 """
 
-SCHOLARSHIP_CONFIGS = {
-    "SJSU General Scholarship": {
-        "scholarship_type": "SJSU General Scholarship",
-        "rubric_id": "sjsu-general",
-        "column_map": {
-            "AvailabilityId_t": "availability_id",
-            "Student": "student_id",
-            "PS_Academic Program": "academic_program",
-            "PS_Major(s)": "major",
-            "PS_Academic Level": "academic_level",
-            "PS_Cumulative GPA": "gpa",
-        },
-        "essay_fields": [
-            {
-                "raw_column": "FASO_General_Career Goals",
-                "question_id": "career_goals",
-                "question": "What are your career goals?",
-            },
-            {
-                "raw_column": "FASO_General_Challenge or Mistake",
-                "question_id": "challenge_or_mistake",
-                "question": "Describe a challenge or mistake and what you learned from it.",
-            },
-            {
-                "raw_column": "FASO_General_Extracurricular Activities",
-                "question_id": "extracurricular_activities",
-                "question": "Describe your extracurricular activities.",
-            },
-        ],
+import re
+
+# The single supported phase-1 scope.
+SCHOLARSHIP_SCOPE = "sjsu_general"
+
+# ---- Active (supported) config: SJSU General ----
+SJSU_GENERAL_CONFIG = {
+    "scope": SCHOLARSHIP_SCOPE,
+    "scholarship_type": "SJSU General Scholarship",
+    "supported": True,
+    # filename substrings that identify an SJSU General application workbook
+    "filename_markers": ["SJSU General Scholarship", "SJSU General Scholarships"],
+    "column_map": {
+        "AvailabilityId_t": "availability_id",
+        "Student": "student_uuid",
+        "PS_Academic Program": "academic_program",
+        "PS_Major(s)": "major",
+        "PS_Academic Level": "academic_level",
+        "PS_Cumulative GPA": "gpa",
     },
-    "College of Engineering Dean_s Student Scholarship": {
+    "essay_fields": [
+        {
+            "raw_column": "FASO_General_Career Goals",
+            "question_id": "career_goals",
+            "question": "What are your career goals?",
+        },
+        {
+            "raw_column": "FASO_General_Challenge or Mistake",
+            "question_id": "challenge_or_mistake",
+            "question": "Describe a challenge or mistake and what you learned from it.",
+        },
+        {
+            "raw_column": "FASO_General_Extracurricular Activities",
+            "question_id": "extracurricular_activities",
+            "question": "Describe your extracurricular activities.",
+        },
+    ],
+}
+
+# ---- UNSUPPORTED stubs (extensibility placeholders, NOT scored in phase 1) ----
+# These exist only to document the intended extension path. The parser and scorer
+# ignore them. Do NOT claim support for these in phase 1.
+UNSUPPORTED_SCHOLARSHIPS = {
+    "coeng-deans": {
+        "scope": "coeng_deans",
         "scholarship_type": "College of Engineering Dean's Student Scholarship",
-        "rubric_id": "coeng-deans",
-        "column_map": {
-            "AvailabilityId_t": "availability_id",
-            "Student": "student_id",
-            "PS_Cumulative GPA": "gpa",
-        },
-        "essay_fields": [
-            {
-                "raw_column": "FASO_General_Career Goals",
-                "question_id": "career_goals",
-                "question": "What are your career goals?",
-            },
-            {
-                "raw_column": "FASO_General_Challenge or Mistake",
-                "question_id": "challenge_or_mistake",
-                "question": "Describe a challenge or mistake and what you learned from it.",
-            },
-            {
-                "raw_column": "FASO_General_Extracurricular Activities",
-                "question_id": "extracurricular_activities",
-                "question": "Describe your extracurricular activities.",
-            },
-            {
-                "raw_column": "COENG_Leadership",
-                "question_id": "department_specific",
-                "question": "Describe your leadership experience and what demonstrates your potential for success as an engineering student.",
-                "topic": "Leadership",
-            },
-        ],
+        "supported": False,
+        "note": "Phase 2+ — department-specific rubric not implemented.",
     },
-    "Lurie College of Education General Scholarship": {
+    "lurie-coed-general": {
+        "scope": "lurie_coed_general",
         "scholarship_type": "Lurie College of Education General Scholarship",
-        "rubric_id": "lurie-coed-general",
-        "column_map": {
-            "AvailabilityId_t": "availability_id",
-            "Student": "student_id",
-        },
-        "essay_fields": [
-            {
-                "raw_column": "FASO_General_Career Goals",
-                "question_id": "career_goals",
-                "question": "What are your career goals?",
-            },
-            {
-                "raw_column": "FASO_General_Challenge or Mistake",
-                "question_id": "challenge_or_mistake",
-                "question": "Describe a challenge or mistake and what you learned from it.",
-            },
-            {
-                "raw_column": "COED_Career Goals",
-                "alt_columns": ["LCOE_Career Goals"],
-                "question_id": "department_specific",
-                "question": "Describe your career goals specific to the College of Education.",
-                "topic": "Department Career Goals",
-            },
-        ],
+        "supported": False,
+        "note": "Phase 2+ — department-specific rubric not implemented.",
     },
-    "Physics Department Scholarship": {
+    "physics-dept": {
+        "scope": "physics_dept",
         "scholarship_type": "Physics Department Scholarship",
-        "rubric_id": "physics-dept",
-        "column_map": {
-            "AvailabilityId_t": "availability_id",
-            "Student": "student_id",
-            "PS_Cumulative GPA": "gpa",
-            "FASO_General_Self-Reported GPA": "self_reported_gpa",
-        },
-        "essay_fields": [
-            {
-                "raw_column": "FASO_General_Career Goals",
-                "question_id": "career_goals",
-                "question": "What are your career goals?",
-            },
-            {
-                "raw_column": "FASO_General_Challenge or Mistake",
-                "question_id": "challenge_or_mistake",
-                "question": "Describe a challenge or mistake and what you learned from it.",
-            },
-            {
-                "raw_column": "FASO_General_Extracurricular Activities",
-                "question_id": "extracurricular_activities",
-                "question": "Describe your extracurricular activities.",
-            },
-            {
-                "raw_column": "COS_J. Williams_Challenges",
-                "question_id": "department_specific",
-                "question": "Describe a challenge you have faced in your academic or personal life and how you overcame it (J. Williams Scholarship).",
-                "topic": "Challenges",
-            },
-        ],
+        "supported": False,
+        "note": "Phase 2+ — department-specific rubric not implemented.",
     },
 }
 
+NUMERIC_FIELDS = {"gpa", "self_reported_gpa"}
+_YEAR_RE = re.compile(r"(\d{2}-\d{2})")
 
-def identify_scholarship(filename: str) -> dict | None:
-    """Match a filename to a scholarship config. Returns config dict or None."""
-    for key, config in SCHOLARSHIP_CONFIGS.items():
-        if key in filename:
-            return config
+
+def identify_scholarship(filename: str):
+    """Return the SUPPORTED config for a workbook filename, else None.
+
+    Phase 1: only SJSU General is recognized. Specialized workbooks return None
+    (skipped, logged as unsupported).
+    """
+    for marker in SJSU_GENERAL_CONFIG["filename_markers"]:
+        if marker in filename:
+            return SJSU_GENERAL_CONFIG
     return None
 
 
 def extract_year(filename: str) -> str | None:
     """Extract academic year from filename (e.g. '25-26' or '26-27')."""
-    import re
+    m = _YEAR_RE.search(filename)
+    return m.group(1) if m else None
 
-    match = re.search(r"(\d{2}-\d{2})", filename)
-    return match.group(1) if match else None
+
+def candidate_key_from_uuid(student_uuid: str) -> str | None:
+    """Last 12 hex chars of the student UUID (final segment). For eval joins."""
+    if not student_uuid:
+        return None
+    hex_only = re.sub(r"[^0-9a-fA-F]", "", str(student_uuid))
+    return hex_only[-12:].lower() if len(hex_only) >= 12 else None
+
+
+def build_application_key(year: str, student_uuid: str) -> str:
+    """Deterministic PK: sjsu_general#{year}#{student_uuid}."""
+    return f"{SCHOLARSHIP_SCOPE}#{year}#{student_uuid}"

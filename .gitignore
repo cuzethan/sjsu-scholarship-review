@@ -25,3 +25,8 @@ __pycache__/
 lambdas/**/package/
 lambdas/**/deployment.zip
 lambdas/**/output.json
+
+# evaluation harness — uploaded data (PII) and generated artifacts
+evaluation/input/applications/*.xlsx
+evaluation/input/scores/*.xlsx
+evaluation/output/

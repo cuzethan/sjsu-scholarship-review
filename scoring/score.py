@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +25,8 @@ from pathlib import Path
 import boto3
 
 # --- Config ---
-AWS_PROFILE = "Samson"
-AWS_REGION = "us-west-2"
+AWS_PROFILE = os.environ.get("AWS_PROFILE", "Samson")
+AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 APPLICATIONS_TABLE = "sjsu-applications"
 SCORES_TABLE = "sjsu-scores"
 

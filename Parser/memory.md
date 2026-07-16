@@ -419,3 +419,45 @@ use INFERENCE_PROFILE (prefix model id with `us.`).
 3. Wire dashboard API (apps/api) to read sjsu-applications + sjsu-scores.
 4. Add human-review / disagreement workflow later.
 5. IAM for scoring Lambda: bedrock:InvokeModel + dynamodb Query/Scan (apps) + PutItem (scores).
+
+
+---
+
+## 2026-07-15: Phase 1 refactor — SJSU General ONLY (branch feat/phase1-sjsu-general)
+
+Narrowed the whole project to phase-1 scope: SJSU General Scholarship only, both
+25-26 and 26-27, one shared rubric + one shared prompt. Specialized scholarships
+are marked-unsupported stubs (never parsed/scored).
+
+### Schema change (removed rubric_id)
+Parsed application schema is now keyed by a deterministic `application_key =
+sjsu_general#{year}#{student_uuid}`. Fields: student_uuid, availability_id,
+candidate_key (last 12 hex, for eval joins), scholarship_scope=sjsu_general, year,
+student_name(None), gpa, academic_program, academic_level, major, qa_pairs,
+source, status='parsed'. **No rubric_id** in the active path.
+
+### DynamoDB (recreated, keyed by application_key)
+- `sjsu-applications`: PK application_key; NEW_IMAGE stream (ARN ...stream/2026-07-15T23:28:18.363); GSI scope-year-index (scholarship_scope HASH + year RANGE).
+- `sjsu-scores`: PK application_key. Stores criterion_scores, weighted_total, reasoning_summary, confidence, model_id, scholarship_scope, year, status, scored_at.
+
+### Files
+- `lambdas/parse-applications/{handler.py, scholarship_config.py}` — rewritten for phase-1 schema; identify_scholarship returns SJSU General only.
+- `lambdas/score-applications/{handler.py, prompt.py, sjsu_general_rubric.md, requirements.txt}` — NEW scoring Lambda. DynamoDB Streams trigger, batch ~5 (set on ESM at deploy), Bedrock Converse (MODEL_ID env, default us.anthropic.claude-haiku-4-5, temp=0 / anthropic omits topP), strict JSON validate, writes to sjsu-scores. boto3-only (Lambda runtime), no package/ needed.
+- `evaluation/{config.py, human_scores.py, dataset_builder.py}` — narrowed to sjsu-general (EVAL_SCOPE_RUBRIC_IDS). Verified dry-run: only "SJSU General Scholarship | 26-27" (4875 joined, 20 sampled); 25-26 excluded (no Candidate column).
+- `docs/phase1-sjsu-general.md` + README updated.
+
+### Scoring support vs human-comparison support (KEY)
+- Production scoring: BOTH 25-26 and 26-27 (independent of human scores).
+- Human comparison (eval): 26-27 ONLY. 25-26 score sheet has NO Candidate column → no deterministic join → excluded/documented.
+
+### Deploy TODO (not yet done)
+- Redeploy parse Lambda (schema change). Build in temp dir (OneDrive lock on package/).
+- Deploy score-applications Lambda + create event source mapping on the applications stream (batch size 5, StartingPosition LATEST). IAM: bedrock:InvokeModel + dynamodb read on stream + PutItem on sjsu-scores + AWSLambdaDynamoDBExecutionRole.
+
+### DEPLOYED + VERIFIED END-TO-END (2026-07-15)
+- Parse Lambda rewritten to use **openpyxl directly (no pandas/numpy)** — eliminated the heavy dependency that kept failing to build on the low-disk machine. Zip ~808KB. Redeployed sjsu-parse-applications.
+- Score Lambda deployed: sjsu-score-applications (boto3-only, 5.2KB zip, MODEL_ID=us.anthropic.claude-haiku-4-5, memory 256MB). IAM role sjsu-score-lambda-role (bedrock:InvokeModel + stream read + scores PutItem + basic exec).
+- Event source mapping created: applications stream -> score Lambda, BatchSize=5, MaxBatchingWindow=10s, StartingPosition=LATEST (UUID 643b9651-e46f-42fb-ada2-667bd28ef512).
+- Bug found + fixed during test: scoring Lambda put_item failed "Float types not supported" — nested criterion_scores floats. Fixed by converting whole item to Decimal via json round-trip (parse_float=Decimal). Redeployed.
+- E2E TEST (2-row synthetic SJSU General 25-26 file uploaded to test bucket data/): parse wrote 2 records to sjsu-applications (application_key sjsu_general#25-26#..., status=parsed); stream triggered score Lambda; Bedrock scored both; sjsu-scores got 2 records (weighted_total, confidence, 5 criterion_scores w/ evidence quotes, reasoning_summary, model_id, status=scored). Verified via scan (Count=2). Test data cleaned up afterward.
+- NOTE: never upload a full ~4880-row SJSU file to the trigger bucket unless you intend thousands of Bedrock scoring calls (stream scores every parsed row). Use small batches or disable the ESM for bulk loads.

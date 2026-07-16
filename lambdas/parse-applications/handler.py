@@ -1,25 +1,33 @@
 """
-Lambda: parse-applications
+Lambda: parse-applications  (Phase 1 — SJSU General only)
 
-Triggered by S3 event when a new .xlsx lands in the data/ prefix.
-Parses the spreadsheet into normalized application records (with qa_pairs)
-and writes them to DynamoDB (sjsu-applications table).
+Triggered by S3 event when a new .xlsx lands in the data/ prefix. Parses SJSU
+General Scholarship workbooks (25-26 and 26-27) into normalized application
+records and writes them to DynamoDB keyed by a deterministic `application_key`.
 
-Parser logic mirrors Parser/parser.py from the feat/parser branch.
+Uses openpyxl directly (no pandas/numpy) so the Lambda package stays tiny.
+
+Phase-1 scope:
+- Only SJSU General workbooks are parsed; specialized workbooks are skipped and
+  logged as unsupported.
+- No rubric_id in the schema (single shared rubric handled downstream).
+- Records written with status="parsed"; a DynamoDB Stream triggers scoring.
 """
 
 import io
 import json
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 
 import boto3
-import pandas as pd
+import openpyxl
 
-from scholarship_config import extract_year, identify_scholarship
+from scholarship_config import (
+    NUMERIC_FIELDS, SCHOLARSHIP_SCOPE, build_application_key,
+    candidate_key_from_uuid, extract_year, identify_scholarship,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -27,29 +35,39 @@ logger.setLevel(logging.INFO)
 APPLICATIONS_TABLE = os.environ.get("APPLICATIONS_TABLE", "sjsu-applications")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
-# Fields that should be parsed as numeric
-NUMERIC_FIELDS = {"gpa", "self_reported_gpa"}
-
 
 def get_dynamo_table():
     dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
     return dynamodb.Table(APPLICATIONS_TABLE)
 
 
-def read_xlsx_from_s3(bucket: str, key: str) -> tuple[pd.DataFrame, str]:
-    """Download an xlsx file from S3 and return as DataFrame + sheet name."""
+def read_xlsx_from_s3(bucket: str, key: str):
+    """Download an xlsx from S3 and yield (headers, rows, sheet_name).
+
+    rows is a generator of dicts {column_header: value} using the first row as
+    headers. Uses openpyxl read-only for low memory.
+    """
     s3 = boto3.client("s3", region_name=AWS_REGION)
-    response = s3.get_object(Bucket=bucket, Key=key)
-    body = response["Body"].read()
-    xl = pd.ExcelFile(io.BytesIO(body), engine="openpyxl")
-    sheet_name = xl.sheet_names[0]
-    df = xl.parse(sheet_name)
-    return df, sheet_name
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    wb = openpyxl.load_workbook(io.BytesIO(body), read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header = next(rows_iter)
+    except StopIteration:
+        return [], iter([]), ws.title
+    headers = [str(h).strip() if h is not None else "" for h in header]
+
+    def row_dicts():
+        for raw in rows_iter:
+            yield {headers[i]: raw[i] for i in range(min(len(headers), len(raw)))}
+
+    return headers, row_dicts(), ws.title
 
 
 def clean_value(value, is_numeric: bool = False):
-    """Clean a cell value: handle NaN, strip strings, avoid float artifacts."""
-    if pd.isna(value):
+    """Clean a cell value: handle None/blank, strip strings, avoid float artifacts."""
+    if value is None:
         return None
     if is_numeric:
         try:
@@ -63,162 +81,112 @@ def clean_value(value, is_numeric: bool = False):
     return str(value)
 
 
-def normalize_row(
-    row: pd.Series,
-    config: dict,
-    year: str,
-    file_name: str,
-    sheet_name: str,
-    row_number: int,
-) -> dict | None:
-    """Convert a single DataFrame row into a normalized application dict.
-
-    Builds qa_pairs from config['essay_fields'].
-    Builds structured fields from config['column_map'].
-    """
+def normalize_row(row: dict, config: dict, year: str,
+                  file_name: str, sheet_name: str, row_number: int) -> dict | None:
+    """Convert one row-dict into a phase-1 SJSU General application dict."""
     column_map = config["column_map"]
     essay_fields = config["essay_fields"]
 
     record = {
-        "application_id": str(uuid.uuid4()),
-        "scholarship_type": config["scholarship_type"],
-        "rubric_id": config["rubric_id"],
+        "scholarship_scope": SCHOLARSHIP_SCOPE,
         "year": year,
-        "student_id": None,
+        "student_uuid": None,
         "availability_id": None,
+        "student_name": None,     # not present in this anonymized data
         "gpa": None,
-        "self_reported_gpa": None,
         "academic_program": None,
         "academic_level": None,
         "major": None,
         "qa_pairs": [],
-        "source": {
-            "file_name": file_name,
-            "sheet_name": sheet_name,
-            "row_number": row_number,
-        },
+        "source": {"file_name": file_name, "sheet_name": sheet_name, "row_number": row_number},
+        "status": "parsed",
     }
 
-    # --- Structured fields from column_map ---
     for raw_col, field_name in column_map.items():
-        if raw_col not in row.index:
+        if raw_col not in row:
             continue
-        is_numeric = field_name in NUMERIC_FIELDS
-        value = clean_value(row[raw_col], is_numeric=is_numeric)
-
         if field_name == "availability_id":
-            record["availability_id"] = str(row[raw_col]).strip() if not pd.isna(row[raw_col]) else None
+            v = row[raw_col]
+            record["availability_id"] = str(v).strip() if v is not None else None
         else:
-            record[field_name] = value
+            record[field_name] = clean_value(row[raw_col], is_numeric=field_name in NUMERIC_FIELDS)
 
-    # Skip rows where student_id is missing
-    if record["student_id"] is None:
+    if not record["student_uuid"]:
         return None
 
-    # --- qa_pairs from essay_fields ---
+    record["application_key"] = build_application_key(year, record["student_uuid"])
+    record["candidate_key"] = candidate_key_from_uuid(record["student_uuid"])
+
     for essay_def in essay_fields:
         answer = None
-        columns_to_try = [essay_def["raw_column"]] + essay_def.get("alt_columns", [])
-
-        for col in columns_to_try:
-            if col in row.index:
+        for col in [essay_def["raw_column"]] + essay_def.get("alt_columns", []):
+            if col in row:
                 answer = clean_value(row[col])
                 if answer is not None:
                     break
-
         if answer is None:
             continue
-
-        qa_pair = {
-            "question_id": essay_def["question_id"],
-            "question": essay_def["question"],
-            "answer": answer,
-        }
+        qa = {"question_id": essay_def["question_id"],
+              "question": essay_def["question"], "answer": answer}
         if "topic" in essay_def:
-            qa_pair["topic"] = essay_def["topic"]
-
-        record["qa_pairs"].append(qa_pair)
+            qa["topic"] = essay_def["topic"]
+        record["qa_pairs"].append(qa)
 
     return record
 
 
 def parse_file(bucket: str, key: str) -> list[dict]:
-    """Parse a single xlsx file from S3 into normalized application dicts."""
+    """Parse a single xlsx file. Only SJSU General workbooks are processed."""
     filename = key.split("/")[-1]
 
     config = identify_scholarship(filename)
     if config is None:
-        logger.warning(f"No config found for '{filename}', skipping.")
+        logger.info(f"UNSUPPORTED in phase 1 (SJSU General only), skipping: '{filename}'")
         return []
 
-    year = extract_year(filename)
-    if year is None:
-        logger.warning(f"Could not extract year from '{filename}', using 'unknown'.")
-        year = "unknown"
-
-    df, sheet_name = read_xlsx_from_s3(bucket, key)
-    logger.info(f"Parsing: {filename} | {len(df)} rows | scholarship: {config['scholarship_type']} | year: {year}")
+    year = extract_year(filename) or "unknown"
+    _, rows, sheet_name = read_xlsx_from_s3(bucket, key)
+    logger.info(f"Parsing SJSU General | {filename} | year {year}")
 
     records = []
-    for idx, row in df.iterrows():
-        record = normalize_row(
-            row,
-            config,
-            year,
-            file_name=filename,
-            sheet_name=sheet_name,
-            row_number=idx + 2,  # +2: 1-indexed + header row
-        )
-        if record is not None:
-            records.append(record)
-
-    logger.info(f"Parsed {len(records)} applications from {filename}")
+    for idx, row in enumerate(rows):
+        rec = normalize_row(row, config, year, file_name=filename,
+                            sheet_name=sheet_name, row_number=idx + 2)
+        if rec is not None:
+            records.append(rec)
+    logger.info(f"Parsed {len(records)} SJSU General applications from {filename}")
     return records
 
 
-def write_to_dynamodb(records: list[dict], source_file: str):
-    """Batch write parsed records to DynamoDB.
-
-    Composite key: student_id (PK, stable Excel UUID) + rubric_id (SK).
-    overwrite_by_pkeys de-dupes within a batch if the same student appears twice.
-    """
+def write_to_dynamodb(records: list[dict], source_file: str) -> int:
+    """Batch write records keyed by application_key (deterministic, idempotent)."""
     table = get_dynamo_table()
     parsed_at = datetime.now(timezone.utc).isoformat()
     written = 0
 
-    with table.batch_writer(overwrite_by_pkeys=["student_id", "rubric_id"]) as batch:
+    with table.batch_writer(overwrite_by_pkeys=["application_key"]) as batch:
         for record in records:
-            # Both key attributes are required
-            if not record.get("student_id") or not record.get("rubric_id"):
+            if not record.get("application_key"):
                 continue
-
             item = {
-                "student_id": record["student_id"],
-                "rubric_id": record["rubric_id"],
-                "application_id": record["application_id"],
+                "application_key": record["application_key"],
+                "scholarship_scope": record["scholarship_scope"],
+                "year": record["year"],
+                "student_uuid": record["student_uuid"],
+                "status": record.get("status", "parsed"),
                 "source_file": source_file,
                 "parsed_at": parsed_at,
             }
-
-            # Add non-None top-level fields (keys handled above)
-            for field in ("scholarship_type", "year", "availability_id",
+            for field in ("availability_id", "candidate_key", "student_name",
                           "academic_program", "academic_level", "major"):
                 if record.get(field) is not None:
                     item[field] = record[field]
-
-            # Numeric fields — store as string for DynamoDB compatibility
-            for field in ("gpa", "self_reported_gpa"):
-                if record.get(field) is not None:
-                    item[field] = str(record[field])
-
-            # qa_pairs — store as list (DynamoDB handles nested structures)
+            if record.get("gpa") is not None:
+                item["gpa"] = str(record["gpa"])
             if record.get("qa_pairs"):
                 item["qa_pairs"] = record["qa_pairs"]
-
-            # Source provenance
             if record.get("source"):
                 item["source"] = record["source"]
-
             batch.put_item(Item=item)
             written += 1
 
@@ -227,40 +195,31 @@ def write_to_dynamodb(records: list[dict], source_file: str):
 
 
 def handler(event, context):
-    """Lambda entry point - triggered by S3 event."""
+    """S3-event entry point."""
     logger.info(f"Event received: {json.dumps(event)}")
-
     records_written = 0
 
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = unquote_plus(record["s3"]["object"]["key"])
 
-        # Only process .xlsx files in data/ prefix
         if not key.startswith("data/") or not key.endswith(".xlsx"):
             logger.info(f"Skipping non-xlsx or non-data/ file: {key}")
             continue
-
-        # Skip temp files (Excel lock files)
-        filename = key.split("/")[-1]
-        if filename.startswith("~$"):
+        if key.split("/")[-1].startswith("~$"):
             logger.info(f"Skipping temp file: {key}")
             continue
 
         logger.info(f"Processing: s3://{bucket}/{key}")
-
         try:
             applications = parse_file(bucket, key)
             if applications:
-                written = write_to_dynamodb(applications, source_file=key)
-                records_written += written
+                records_written += write_to_dynamodb(applications, source_file=key)
             else:
-                logger.info(f"No applications parsed from {key}")
+                logger.info(f"No SJSU General applications parsed from {key}")
         except Exception as e:
             logger.error(f"Error processing {key}: {e}", exc_info=True)
             raise
 
-    return {
-        "statusCode": 200,
-        "body": json.dumps({"message": f"Processed {records_written} application records"}),
-    }
+    return {"statusCode": 200,
+            "body": json.dumps({"message": f"Processed {records_written} SJSU General records"})}
