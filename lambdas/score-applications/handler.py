@@ -84,7 +84,6 @@ def score_application(app: dict) -> dict:
         "criterion_scores": None,
         "llm_weighted_score": None,
         "reasoning_summary": None,
-        "confidence": None,
         "failure": None,
     }
     infcfg = {"maxTokens": MAX_TOKENS, "temperature": 0}
@@ -114,7 +113,6 @@ def score_application(app: dict) -> dict:
             result["criterion_scores"] = parsed["criterion_scores"]
             result["llm_weighted_score"] = calculate_final_score(parsed["criterion_scores"])
             result["reasoning_summary"] = parsed.get("reasoning_summary")
-            result["confidence"] = parsed.get("confidence")
             return result
 
         except (json.JSONDecodeError, SchemaError) as e:
@@ -246,7 +244,6 @@ def handler(event, context):
 
         rec = score_application(app)
         _write_score(rec)
-        _update_application(rec)
         if rec["status"] == "scored":
             scored += 1
         else:

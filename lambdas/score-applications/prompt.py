@@ -23,18 +23,16 @@ Return ONLY a single JSON object (no prose, no markdown fences) shaped exactly:
   "criterion_scores": [
     { "criterion": "string  // rubric category name",
       "score": 0,           // number within that category's scale
-      "reasoning": "string",
-      "evidence": [ { "question_id": "string", "quote": "string" } ] }
+      "reasoning": "string" }
   ],
   "weighted_total": 0,      // sum of criterion scores (max 15)
-  "reasoning_summary": "string  // 1-2 sentence overall justification",
-  "confidence": 0.0         // 0.0 to 1.0
+  "reasoning_summary": "string  // 1-2 sentence overall justification"
 }
 
 Rules:
 - One entry per rubric category (5 total).
 - Score only from provided application content; do not invent facts.
-- Quote exact application text in evidence; empty list if none, and say so in reasoning.
+- All strings MUST be properly JSON-escaped: use \\n for newlines, \\" for quotes, \\\\ for backslashes.
 - Return ONLY the JSON object.
 """
 
@@ -68,15 +66,51 @@ def build_user_message(app: dict) -> str:
 
 
 def extract_json(text: str) -> dict:
-    """Pull a JSON object out of a model response (strips markdown fences)."""
+    """Pull a JSON object out of a model response (strips markdown fences).
+    Attempts repair of common LLM JSON errors before giving up."""
     text = (text or "").strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    fence = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
     if fence:
         text = fence.group(1)
     else:
-        brace = re.search(r"(\{.*\})", text, re.DOTALL)
+        brace = re.search(r'(\{.*\})', text, re.DOTALL)
         if brace:
             text = brace.group(1)
+
+    # First try: parse as-is
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Repair attempt: fix common issues
+    repaired = text
+    # Fix unescaped newlines inside strings
+    repaired = re.sub(r'(?<!\\)\n', '\\n', repaired)
+    # Fix trailing commas before } or ]
+    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: extract criterion_scores and rebuild
+    cs_match = re.search(r'"criterion_scores"\s*:\s*(\[.*?\])\s*,', repaired, re.DOTALL)
+    wt_match = re.search(r'"weighted_total"\s*:\s*([\d.]+)', repaired)
+    if cs_match:
+        try:
+            cs = json.loads(cs_match.group(1))
+            wt = float(wt_match.group(1)) if wt_match else 0
+            return {
+                "criterion_scores": cs,
+                "weighted_total": wt,
+                "reasoning_summary": "JSON repaired - partial parse",
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # Give up - raise the original error
     return json.loads(text)
 
 
@@ -120,14 +154,6 @@ def validate(obj) -> dict:
             raise SchemaError(f"criterion_scores[{i}].score must be a number")
         if not isinstance(c.get("reasoning"), str):
             raise SchemaError(f"criterion_scores[{i}].reasoning must be a string")
-        ev = c.get("evidence", [])
-        if not isinstance(ev, list):
-            raise SchemaError(f"criterion_scores[{i}].evidence must be a list")
     if isinstance(obj.get("weighted_total"), bool) or not isinstance(obj.get("weighted_total"), (int, float)):
         raise SchemaError("weighted_total must be a number")
-    if not isinstance(obj.get("reasoning_summary", ""), str):
-        raise SchemaError("reasoning_summary must be a string")
-    conf = obj.get("confidence")
-    if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
-        raise SchemaError("confidence must be a number in [0,1]")
     return obj
